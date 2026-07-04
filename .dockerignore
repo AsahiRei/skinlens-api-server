@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+.venv/
+.git/
+.vscode/
+*.ipynb
+datasets/
+train/
+test/
+models/chatbot/
+backup.txt

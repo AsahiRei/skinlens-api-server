@@ -1,0 +1,44 @@
+import uvicorn
+from utils.detection import predict_skin_url, predict_skin_url_with_heatmap, predict_skin_file
+from fastapi import FastAPI
+from pydantic import BaseModel
+from fastapi import UploadFile, File
+from insightface.app import FaceAnalysis
+import cv2
+import numpy as np
+
+app = FastAPI()
+
+class ImageRequest(BaseModel):
+    image_url: str
+
+@app.get("/")
+def read_root():
+    return {
+        "message": "Welcome to SkinLens API Server",
+        "version": "1.0.0",
+        "author": "Arn Christian S. Rosales"
+    }
+
+@app.post("/analyze")
+async def analyze(image: UploadFile = File(...)):
+    contents = await image.read()
+    app = FaceAnalysis(providers=['CPUExecutionProvider'])
+    app.prepare(ctx_id=-1)
+    image_array = np.frombuffer(contents, dtype=np.uint8)
+    img = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+    faces = app.get(img)
+    if len(faces) == 0:
+        return {"error": "No face detected in the image"}
+    return predict_skin_file(contents)
+
+@app.post("/predict-skin-url")
+def predict_url(request: ImageRequest):
+    return predict_skin_url(request.image_url)
+
+@app.post("/predict-skin-url-with-heatmap")
+def predict_skin_with_heatmap(request: ImageRequest):
+    return predict_skin_url_with_heatmap(request.image_url)
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)

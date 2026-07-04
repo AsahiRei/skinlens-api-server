@@ -1,0 +1,189 @@
+import os
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+import tensorflow as tf
+import numpy as np
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import classification_report, confusion_matrix
+
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 32
+SEED = 42
+
+TRAIN_DIR = "datasets/detection/train"
+VALID_DIR = "datasets/detection/valid"
+TEST_DIR = "datasets/detection/test"
+
+MODEL_PATH = "models/detection/detection_model.keras"
+
+train_ds = tf.keras.utils.image_dataset_from_directory(
+    TRAIN_DIR,
+    label_mode="categorical",
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    seed=SEED
+)
+val_ds = tf.keras.utils.image_dataset_from_directory(
+    VALID_DIR,
+    label_mode="categorical",
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    shuffle=False
+)
+test_ds = tf.keras.utils.image_dataset_from_directory(
+    TEST_DIR,
+    label_mode="categorical",
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    shuffle=False
+)
+
+class_labels = train_ds.class_names
+print("Class labels:", class_labels)
+
+def normalize_batch(images, labels):
+    images = tf.keras.applications.mobilenet_v2.preprocess_input(images)
+    return images, labels
+
+train_ds = train_ds.map(normalize_batch, num_parallel_calls=tf.data.AUTOTUNE)
+val_ds = val_ds.map(normalize_batch, num_parallel_calls=tf.data.AUTOTUNE)
+test_ds = test_ds.map(normalize_batch, num_parallel_calls=tf.data.AUTOTUNE)
+
+train_ds = train_ds.cache().shuffle(1000).prefetch(buffer_size=tf.data.AUTOTUNE)
+val_ds = val_ds.cache().prefetch(buffer_size=tf.data.AUTOTUNE)
+test_ds = test_ds.cache().prefetch(buffer_size=tf.data.AUTOTUNE)
+
+y_train = np.concatenate([y.numpy() for _, y in train_ds.unbatch().batch(10000)], axis=0)
+y_train = np.argmax(y_train, axis=1).astype(int).ravel()
+class_weights = compute_class_weight(
+    class_weight="balanced",
+    classes=np.unique(y_train),
+    y=y_train
+)
+class_weights = {i: class_weights[i] for i in range(len(class_weights))}
+num_class = len(class_weights)
+print("Class weights:", class_weights)
+
+data_augmentation = tf.keras.Sequential([
+    tf.keras.layers.RandomFlip("horizontal"),
+    tf.keras.layers.RandomRotation(0.08),
+    tf.keras.layers.RandomZoom(0.1),
+    tf.keras.layers.RandomContrast(0.1),
+    tf.keras.layers.RandomTranslation(0.05, 0.05),
+], name="augmentation")
+
+base_model = tf.keras.applications.MobileNetV2(
+    input_shape=IMG_SIZE + (3,),
+    include_top=False,
+    weights="imagenet"
+)
+base_model.trainable = False
+
+inputs = tf.keras.layers.Input(shape=IMG_SIZE + (3,))
+x = data_augmentation(inputs)
+x = base_model(x, training=False)
+x = tf.keras.layers.GlobalAveragePooling2D()(x)
+x = tf.keras.layers.Dropout(0.2)(x)
+x = tf.keras.layers.Dense(256, activation="relu")(x)
+x = tf.keras.layers.Dropout(0.1)(x)
+outputs = tf.keras.layers.Dense(num_class, activation="softmax")(x)
+model = tf.keras.models.Model(inputs, outputs)
+
+focal_loss = tf.keras.losses.CategoricalFocalCrossentropy(
+    gamma=2.0,
+    alpha=0.25
+)
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+    loss=focal_loss,
+    metrics=[
+        "accuracy",
+        tf.keras.metrics.Precision(name="precision"),
+        tf.keras.metrics.Recall(name="recall"),
+        tf.keras.metrics.AUC(name="auc")
+    ]
+)
+model.summary()
+
+cb = [
+    tf.keras.callbacks.ModelCheckpoint(
+        MODEL_PATH,
+        monitor="val_auc",
+        mode="max",
+        save_best_only=True,
+        verbose=1
+    ),
+    tf.keras.callbacks.EarlyStopping(
+        monitor="val_auc",
+        mode="max",
+        patience=8,
+        restore_best_weights=True,
+        verbose=1
+    ),
+    tf.keras.callbacks.ReduceLROnPlateau(
+        monitor="val_loss",
+        factor=0.3,
+        patience=3,
+        min_lr=1e-6,
+        verbose=1
+    )
+]
+
+history1 = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=15,
+    class_weight=class_weights,
+    callbacks=cb
+)
+
+base_model.trainable = True
+for layer in base_model.layers[:-40]:
+    layer.trainable = False
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
+    loss=focal_loss,
+    metrics=[
+        "accuracy",
+        tf.keras.metrics.Precision(name="precision"),
+        tf.keras.metrics.Recall(name="recall"),
+        tf.keras.metrics.AUC(name="auc")
+    ]
+)
+
+history2 = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=10,
+    class_weight=class_weights,
+    callbacks=cb
+)
+
+results = model.evaluate(test_ds, verbose=1)
+for name, value in zip(model.metrics_names, results):
+    print(f"{name}: {value:.4f}")
+
+y_true = []
+y_pred = []
+
+for images, labels in test_ds:
+    preds = model.predict(images, verbose=0)
+    preds = np.argmax(preds, axis=1)
+    y_pred.extend(preds)
+    y_true.extend(np.argmax(labels.numpy(), axis=1))
+
+print("\nConfusion Matrix:")
+print(confusion_matrix(y_true, y_pred))
+
+print("\nClassification Report:")
+print(classification_report(
+    y_true,
+    y_pred,
+    target_names=class_labels,
+    digits=4
+))
+
+model.save(MODEL_PATH)
+print(f"\nSaved model to {MODEL_PATH}")
